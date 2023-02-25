@@ -17,7 +17,40 @@ namespace LiteDB
         private readonly EngineSettings _settings;
         private readonly Mutex _mutex;
         private LiteEngine _engine;
-        private int _stack = 0;
+        private Random rand = new Random(
+                    Guid.NewGuid().GetHashCode()
+                    );
+
+        //Thread safe bool, default is 0 as false;
+        private volatile int _threadSafeBoolBackValueForIsMutexLocking = 0;
+        private bool isMutexLocking
+        {
+            get
+            {
+                return (Interlocked.CompareExchange(ref _threadSafeBoolBackValueForIsMutexLocking, 1, 1) == 1);
+            }
+            set
+            {
+                if (value) Interlocked.CompareExchange(ref _threadSafeBoolBackValueForIsMutexLocking, 1, 0);
+                else Interlocked.CompareExchange(ref _threadSafeBoolBackValueForIsMutexLocking, 0, 1);
+            }
+        }
+
+        //Thread safe bool, default is 0 as false;
+        private volatile int _threadSafeBoolBackValueForIsDisposed = 0;
+        private bool isDisposed
+        {
+            get
+            {
+                return (Interlocked.CompareExchange(ref _threadSafeBoolBackValueForIsDisposed, 1, 1) == 1);
+            }
+            set
+            {
+                if (value) Interlocked.CompareExchange(ref _threadSafeBoolBackValueForIsDisposed, 1, 0);
+                else Interlocked.CompareExchange(ref _threadSafeBoolBackValueForIsDisposed, 0, 1);
+            }
+        }
+
 
         public SharedEngine(EngineSettings settings)
         {
@@ -28,8 +61,9 @@ namespace LiteDB
             try
             {
 #if NETFRAMEWORK
-                var allowEveryoneRule = new MutexAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null),
-                           MutexRights.FullControl, AccessControlType.Allow);
+                var allowEveryoneRule = new MutexAccessRule(
+                    new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                    MutexRights.FullControl, AccessControlType.Allow);
 
                 var securitySettings = new MutexSecurity();
                 securitySettings.AddAccessRule(allowEveryoneRule);
@@ -41,7 +75,8 @@ namespace LiteDB
             }
             catch (NotSupportedException ex)
             {
-                throw new PlatformNotSupportedException("Shared mode is not supported in platforms that do not implement named mutex.", ex);
+                throw new PlatformNotSupportedException
+                    ("Shared mode is not supported in platforms that do not implement named mutex.", ex);
             }
         }
 
@@ -50,26 +85,48 @@ namespace LiteDB
         /// </summary>
         private void OpenDatabase()
         {
-            lock (_mutex)
+            if (!isMutexLocking)
             {
-                _stack++;
+                lock (_mutex)
+                {
+                    isMutexLocking = true;
+                    if (_engine == null)
+                    {
+                        try
+                        {
+                            _mutex.WaitOne();
+                        }
+                        catch (AbandonedMutexException) { }
+                        catch { isMutexLocking = false; throw; }
 
-                if (_stack == 1)
+                        try
+                        {
+                            _engine = new LiteEngine(_settings);
+                            isDisposed = false;
+                        }
+                        catch
+                        {
+                            try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                            isMutexLocking = false;
+                            throw;
+                        }
+                    }
+                    isMutexLocking = false;
+                }
+            }
+            else
+            {
+                if (_engine == null)
                 {
                     try
                     {
-                        _mutex.WaitOne();
-                    }
-                    catch (AbandonedMutexException) { }
-
-                    try
-                    {
                         _engine = new LiteEngine(_settings);
+                        isDisposed = false;
                     }
                     catch
                     {
-                        _mutex.ReleaseMutex();
-                        _stack = 0;
+                        try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                        isMutexLocking = false;
                         throw;
                     }
                 }
@@ -81,16 +138,23 @@ namespace LiteDB
         /// </summary>
         private void CloseDatabase()
         {
-            lock (_mutex)
+            if (!isMutexLocking)
             {
-                _stack--;
-
-                if (_stack == 0)
+                lock (_mutex)
                 {
-                    _engine.Dispose();
-                    _engine = null;
-
-                    _mutex.ReleaseMutex();
+                    isMutexLocking = true;
+                    if (_engine != null)
+                    {
+                        this.Dispose(true);
+                    }
+                    isMutexLocking = false;
+                }
+            }
+            else
+            {
+                if (_engine != null)
+                {
+                    this.Dispose(true);
                 }
             }
         }
@@ -99,51 +163,129 @@ namespace LiteDB
 
         public bool BeginTrans()
         {
-            this.OpenDatabase();
-
-            try
+            EnsureLocking();
+            lock (_mutex)
             {
-                var result = _engine.BeginTrans();
+                isMutexLocking = true;
 
-                if (result == false)
+                try
                 {
-                    _stack--;
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
+
+                this.OpenDatabase();
+
+                bool val = false;
+                try
+                {
+                    var result = _engine.BeginTrans();
+                    /*
+                    if(result == false)
+                    {
+
+                    }
+                    */
+                    val = result;
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
                 }
 
-                return result;
-            }
-            catch
-            {
-                this.CloseDatabase();
-                throw;
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool Commit()
         {
-            if (_engine == null) return false;
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
 
-            try
-            {
-                return _engine.Commit();
-            }
-            finally
-            {
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
+
+                if (_engine == null || isDisposed)
+                {
+                    isDisposed = true;
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    return false;
+                }
+
+                bool val = false;
+                try
+                {
+                    val = _engine.Commit();
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool Rollback()
         {
-            if (_engine == null) return false;
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
 
-            try
-            {
-                return _engine.Rollback();
-            }
-            finally
-            {
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
+
+                if (_engine == null || isDisposed)
+                {
+                    isDisposed = true;
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    return false;
+                }
+
+                bool val = false;
+                try
+                {
+                    val = _engine.Rollback();
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
@@ -153,38 +295,117 @@ namespace LiteDB
 
         public IBsonDataReader Query(string collection, Query query)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
 
-            var reader = _engine.Query(collection, query);
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            return new SharedDataReader(reader, () => this.CloseDatabase());
+                this.OpenDatabase();
+
+                SharedDataReader bsonDataReader = null;
+                try
+                {
+                    var reader = _engine.Query(collection, query);
+                    bsonDataReader = new SharedDataReader(reader, () => this.Dispose("Query"));
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                if (bsonDataReader != null)
+                {
+                    return bsonDataReader;
+                }
+                else
+                {
+                    throw new NullReferenceException("Nulled SharedDataReader.");
+                }
+            }
         }
 
         public BsonValue Pragma(string name)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
 
-            try
-            {
-                return _engine.Pragma(name);
-            }
-            finally
-            {
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
+
+                this.OpenDatabase();
+
+                BsonValue val = null;
+                try
+                {
+                    val = _engine.Pragma(name);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool Pragma(string name, BsonValue value)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Pragma(name, value);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                bool val = false;
+                try
+                {
+                    val = _engine.Pragma(name, value);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
@@ -194,196 +415,531 @@ namespace LiteDB
 
         public int Checkpoint()
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Checkpoint();
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.Checkpoint();
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public long Rebuild(RebuildOptions options)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Rebuild(options);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                long val;
+                try
+                {
+                    val = _engine.Rebuild(options);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public int Insert(string collection, IEnumerable<BsonDocument> docs, BsonAutoId autoId)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Insert(collection, docs, autoId);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.Insert(collection, docs, autoId);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public int Update(string collection, IEnumerable<BsonDocument> docs)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Update(collection, docs);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.Update(collection, docs);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public int UpdateMany(string collection, BsonExpression extend, BsonExpression predicate)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.UpdateMany(collection, extend, predicate);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.UpdateMany(collection, extend, predicate);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public int Upsert(string collection, IEnumerable<BsonDocument> docs, BsonAutoId autoId)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Upsert(collection, docs, autoId);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.Upsert(collection, docs, autoId);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public int Delete(string collection, IEnumerable<BsonValue> ids)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.Delete(collection, ids);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.Delete(collection, ids);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public int DeleteMany(string collection, BsonExpression predicate)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.DeleteMany(collection, predicate);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                int val;
+                try
+                {
+                    val = _engine.DeleteMany(collection, predicate);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool DropCollection(string name)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.DropCollection(name);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                bool val = false;
+                try
+                {
+                    val = _engine.DropCollection(name);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool RenameCollection(string name, string newName)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.RenameCollection(name, newName);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                bool val = false;
+                try
+                {
+                    val = _engine.RenameCollection(name, newName);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool DropIndex(string collection, string name)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.DropIndex(collection, name);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                bool val = false;
+                try
+                {
+                    val = _engine.DropIndex(collection, name);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
             }
         }
 
         public bool EnsureIndex(string collection, string name, BsonExpression expression, bool unique)
         {
-            this.OpenDatabase();
+            EnsureLocking();
+            lock (_mutex)
+            {
+                isMutexLocking = true;
+                try
+                {
+                    _mutex.WaitOne();
+                }
+                catch (AbandonedMutexException) { }
+                catch { isMutexLocking = false; throw; }
 
-            try
-            {
-                return _engine.EnsureIndex(collection, name, expression, unique);
-            }
-            finally
-            {
+                this.OpenDatabase();
+
+                bool val = false;
+                try
+                {
+                    val = _engine.EnsureIndex(collection, name, expression, unique);
+                }
+                catch
+                {
+                    this.CloseDatabase();
+                    try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                    isMutexLocking = false;
+                    throw;
+                }
+
                 this.CloseDatabase();
+                try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+                isMutexLocking = false;
+                return val;
+            }
+        }
+        #endregion
+
+        private void EnsureLocking()
+        {
+            int count = 0;
+            System.Threading.Tasks.Task delay;
+            while (isMutexLocking)
+            {
+                delay = System.Threading.Tasks.Task.Delay(
+                    TimeSpan.FromMilliseconds(
+                        rand.Next(3, 7)
+                        )
+                    );
+                delay.Wait();
+                if (!isMutexLocking) { break; }
+                if (delay.IsCompleted)
+                {
+                    ++count;
+
+                    if (count > 100)
+                    {
+                        count = 0;
+                        throw new TimeoutException("Shared threading controller with Mutex is Locking.");
+                    }
+                }
             }
         }
 
-        #endregion
-
         public void Dispose()
         {
+            this.Dispose(false);
+        }
+
+        public void Dispose(string fromQuery = "yes")
+        {
             this.Dispose(true);
+            isMutexLocking = false;
             GC.SuppressFinalize(this);
         }
 
         ~SharedEngine()
         {
             this.Dispose(false);
+            try { _mutex.ReleaseMutex(); } catch { isMutexLocking = false; throw; }
+            isMutexLocking = false;
+            GC.SuppressFinalize(this);
         }
 
         protected virtual void Dispose(bool disposing)
         {
+            if (_engine == null || isDisposed)
+            {
+                isDisposed = true;
+                return;
+            }
+
             if (disposing)
             {
                 if (_engine != null)
                 {
-                    _engine.Dispose();
+                    if (!isMutexLocking)
+                    {
+                        lock (_mutex)
+                        {
+                            isMutexLocking = true;
 
-                    _mutex.ReleaseMutex();
+                            try
+                            {
+                                _engine.Dispose();
+                                _engine = null;
+                            }
+                            catch
+                            {
+                                _engine = null;
+                            }
+                            finally
+                            {
+                                isDisposed = true;
+                            }
+
+                            isMutexLocking = false;
+                        }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            _engine.Dispose();
+                            _engine = null;
+                        }
+                        catch
+                        {
+                            _engine = null;
+                        }
+                        finally
+                        {
+                            isDisposed = true;
+                        }
+                    }
                 }
             }
+
+            GC.Collect();
         }
     }
 }
